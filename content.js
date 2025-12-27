@@ -1,278 +1,225 @@
-// ===============================
-// Twitch Voice → Chat (Stable)
-// ===============================
+// Twitch Voice → Chat (Slate-safe, append-mode, autosend toggle)
 (function () {
-  'use strict';
+  const LANG = 'uk-UA';
 
-  const RECO_LANG = 'uk-UA';
   let recognition = null;
-  let isRecording = false;
+  let recording = false;
   let injected = false;
+
   let autoSend = true;
+  let appendMode = true;
 
-  // ===============================
-  // Utils
-  // ===============================
-  function log(...args) {
-    console.log('[tv2c]', ...args);
-  }
+  /* ================= Speech ================= */
 
-  function warn(...args) {
-    console.warn('[tv2c]', ...args);
-  }
-
-  function error(...args) {
-    console.error('[tv2c]', ...args);
-  }
-
-  // ===============================
-  // Speech Recognition
-  // ===============================
-  function getRecognition() {
+  function createRecognition() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return null;
-    const rec = new SR();
-    rec.lang = RECO_LANG;
-    rec.interimResults = true;
-    rec.continuous = false;
-    return rec;
+
+    const r = new SR();
+    r.lang = LANG;
+    r.interimResults = true;
+    r.continuous = true;
+    return r;
   }
 
-  // ===============================
-  // Twitch elements
-  // ===============================
-  function getChatInput() {
-    return document.querySelector('[data-a-target="chat-input"]');
+  /* ================= Twitch ================= */
+
+  const getInput = () =>
+    document.querySelector('[data-a-target="chat-input"]');
+
+  const getSendBtn = () =>
+    document.querySelector('[data-a-target="chat-send-button"]');
+
+  function focusInput(input) {
+    input.focus();
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    const r = document.createRange();
+    r.selectNodeContents(input);
+    r.collapse(false);
+    sel.addRange(r);
   }
 
-  function getSendButton() {
-    return document.querySelector('[data-a-target="chat-send-button"]');
+  /* ================= UA punctuation ================= */
+
+  function applyUAPunctuation(text) {
+    let t = text;
+
+    const map = {
+      ' кома': ',',
+      ' крапка': '.',
+      ' знак питання': '?',
+      ' знак оклику': '!',
+      ' двокрапка': ':',
+      ' крапка з комою': ';'
+    };
+
+    for (const k in map) {
+      t = t.replace(new RegExp(k, 'gi'), map[k]);
+    }
+
+    t = t.replace(/\bнова строка\b/gi, '\n');
+    t = t.replace(/\bабзац\b/gi, '\n\n');
+
+    t = t.replace(/([.!?]\s*)([а-яіїє])/g, (_, a, b) => a + b.toUpperCase());
+    return t;
   }
 
-  // ===============================
-  // UI Injection
-  // ===============================
+  /* ================= Slate insert ================= */
+
+  function insertText(text) {
+    const input = getInput();
+    if (!input || !input.isContentEditable) return;
+
+    focusInput(input);
+
+    if (!appendMode) {
+      document.execCommand('selectAll', false, null);
+      document.execCommand('delete', false, null);
+    }
+
+    const dt = new DataTransfer();
+    dt.setData('text/plain', text);
+
+    input.dispatchEvent(
+      new ClipboardEvent('paste', {
+        clipboardData: dt,
+        bubbles: true,
+        cancelable: true
+      })
+    );
+
+    // destroy zero-width
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', { bubbles: true, key: ' ' })
+    );
+    document.execCommand('delete', false, null);
+
+    console.log('[tv2c] inserted:', text);
+  }
+
+  function sendMessage() {
+    const btn = getSendBtn();
+    if (!btn) return;
+
+    btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+    console.log('[tv2c] sent');
+  }
+
+  /* ================= Recording ================= */
+
+  function start(btn, status, dot) {
+    if (recording) return;
+
+    recognition = createRecognition();
+    if (!recognition) {
+      status.textContent = 'Speech API недоступний';
+      return;
+    }
+
+    recording = true;
+    btn.classList.add('tv2c-active');
+    dot.style.display = 'inline-block';
+    status.textContent = '🎙️ Слухаю…';
+
+    recognition.onresult = (e) => {
+      let final = '';
+
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) {
+          final += e.results[i][0].transcript.trim() + ' ';
+        }
+      }
+
+      if (final) {
+        const text = applyUAPunctuation(final.trim());
+        insertText(text + ' ');
+        if (autoSend) sendMessage();
+      }
+    };
+
+    recognition.onend = () => {
+      if (recording) recognition.start();
+    };
+
+    recognition.start();
+  }
+
+  function stop(btn, status, dot) {
+    recording = false;
+    btn.classList.remove('tv2c-active');
+    dot.style.display = 'none';
+    status.textContent = '';
+
+    try { recognition.stop(); } catch (_) {}
+    recognition = null;
+  }
+
+  /* ================= UI ================= */
+
   function ensureUI() {
     if (injected) return;
+    const input = getInput();
+    if (!input) return;
 
-    const input = getChatInput();
-    if (!input || !input.parentElement) return;
+    const micBtn = document.createElement('button');
+    micBtn.textContent = '🎤';
+    micBtn.title = 'Alt+V';
+    micBtn.className = 'tv2c-btn';
 
-    const btn = document.createElement('button');
-    btn.className = 'tv2c-btn';
-    btn.type = 'button';
-    btn.title = 'Голос → Текст (Alt+V)';
-    btn.textContent = autoSend ? '🎤📩' : '🎤';
-
-    const status = document.createElement('span');
-    status.className = 'tv2c-status';
+    const sendToggle = document.createElement('button');
+    sendToggle.textContent = '📩A';
+    sendToggle.title = 'Автовідправлення';
+    sendToggle.className = 'tv2c-btn tv2c-autosend';
 
     const dot = document.createElement('span');
     dot.className = 'tv2c-dot';
     dot.style.display = 'none';
 
-    input.parentElement.appendChild(btn);
-    input.parentElement.appendChild(dot);
-    input.parentElement.appendChild(status);
+    const status = document.createElement('span');
+    status.className = 'tv2c-status';
 
-    btn.addEventListener('click', () => toggleRecording(btn, status, dot));
+    input.parentElement.append(micBtn, sendToggle, dot, status);
 
-    btn.addEventListener('contextmenu', (e) => {
+    micBtn.onclick = () =>
+      recording ? stop(micBtn, status, dot) : start(micBtn, status, dot);
+
+    micBtn.oncontextmenu = (e) => {
       e.preventDefault();
+      appendMode = !appendMode;
+      status.textContent = appendMode ? '✏️ Append mode' : '🧹 Replace mode';
+      setTimeout(() => status.textContent = '', 1200);
+    };
+
+    sendToggle.onclick = () => {
       autoSend = !autoSend;
-      btn.textContent = autoSend ? '🎤📩' : '🎤';
+      sendToggle.textContent = autoSend ? '📩A' : '📩✖';
       status.textContent = autoSend
-        ? 'Режим: Вставити + Надіслати'
-        : 'Режим: лише Вставити';
-      setTimeout(() => (status.textContent = ''), 2000);
-    });
+        ? 'Автовідправлення: ON'
+        : 'Автовідправлення: OFF';
+      setTimeout(() => status.textContent = '', 1200);
+    };
 
     window.addEventListener('keydown', (e) => {
       if (e.altKey && e.key.toLowerCase() === 'v') {
         e.preventDefault();
-        toggleRecording(btn, status, dot);
+        recording ? stop(micBtn, status, dot) : start(micBtn, status, dot);
       }
     });
 
     injected = true;
-    log('UI injected');
   }
 
-  // ===============================
-  // CORE: Safe text insertion
-  // ===============================
-  function setChatText(text) {
-    const input = document.querySelector('[data-a-target="chat-input"]');
-    if (!input) {
-      console.error('[tv2c] chat input NOT FOUND');
-      return;
-    }
-
-    console.group('[tv2c] setChatText');
-    console.log('text:', text);
-
-    input.focus();
-
-    // 1️⃣ Очистка
-    document.execCommand('selectAll', false, null);
-    document.execCommand('delete', false, null);
-
-    // 2️⃣ СТВОРЮЄМО paste event (КРИТИЧНО)
-    const dt = new DataTransfer();
-    dt.setData('text/plain', text);
-
-    const pasteEvent = new ClipboardEvent('paste', {
-      clipboardData: dt,
-      bubbles: true,
-      cancelable: true
-    });
-
-    input.dispatchEvent(pasteEvent);
-
-    // 3️⃣ Fallback (якщо paste не спрацював)
-    if (!input.innerText.trim()) {
-      console.warn('[tv2c] paste fallback');
-      for (const ch of text) {
-        document.execCommand('insertText', false, ch);
-      }
-    }
-
-    // 4️⃣ Примусовий keydown (Slate hook)
-    input.dispatchEvent(new KeyboardEvent('keydown', {
-      bubbles: true,
-      key: ' ',
-      code: 'Space'
-    }));
-    document.execCommand('delete', false, null);
-
-    // 5️⃣ Діагностика
-    setTimeout(() => {
-      console.log('innerText:', input.innerText);
-      console.log(
-        'zeroWidth:',
-        input.querySelectorAll('[data-slate-zero-width]').length
-      );
-      console.groupEnd();
-    }, 0);
-  }
-
-  // ===============================
-  // Send message
-  // ===============================
-  function sendMessage() {
-    const btn = getSendButton();
-    if (!btn) {
-      warn('send button NOT FOUND');
-      return;
-    }
-
-    log('sending message');
-
-    btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-    btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-    btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-  }
-
-  function isSendEnabled() {
-    const btn = getSendButton();
-    if (!btn) return false;
-    return !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
-  }
-
-  // ===============================
-  // Recording logic
-  // ===============================
-  function toggleRecording(btn, status, dot) {
-    if (isRecording) {
-      stopRecording(btn, status, dot);
-    } else {
-      startRecording(btn, status, dot);
-    }
-  }
-
-  function startRecording(btn, status, dot) {
-    recognition = getRecognition();
-    if (!recognition) {
-      status.textContent = 'Web Speech API недоступний';
-      return;
-    }
-
-    isRecording = true;
-    btn.classList.add('tv2c-active');
-    dot.style.display = 'inline-block';
-    status.textContent = 'Запис…';
-
-    recognition.onresult = (event) => {
-      let finalText = '';
-      let interim = '';
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const t = event.results[i][0].transcript.trim();
-        if (event.results[i].isFinal) {
-          finalText += t + ' ';
-        } else {
-          interim = t;
-        }
-      }
-
-      if (interim) {
-        status.textContent = 'Запис… ' + interim;
-      }
-
-      if (finalText) {
-        setChatText(finalText.trim());
-        if (autoSend) {
-          setTimeout(sendMessage, 80);
-        }
-      }
-    };
-
-    recognition.onerror = (e) => {
-      error('speech error:', e.error);
-      stopRecording(btn, status, dot);
-    };
-
-    recognition.onend = () => {
-      if (isRecording) stopRecording(btn, status, dot);
-    };
-
-    try {
-      recognition.start();
-    } catch (e) {
-      error('cannot start recognition', e);
-      stopRecording(btn, status, dot);
-    }
-  }
-
-  function stopRecording(btn, status, dot) {
-    if (recognition) {
-      try {
-        recognition.stop();
-      } catch (_) {}
-      recognition = null;
-    }
-    isRecording = false;
-    btn.classList.remove('tv2c-active');
-    dot.style.display = 'none';
-    status.textContent = '';
-  }
-
-  // ===============================
-  // Boot
-  // ===============================
-  const observer = new MutationObserver(() => {
-    ensureUI();
-  });
+  const obs = new MutationObserver(ensureUI);
 
   function boot() {
     ensureUI();
-    observer.observe(document.body, { childList: true, subtree: true });
-    log('booted');
+    obs.observe(document.body, { childList: true, subtree: true });
   }
 
-  if (document.readyState === 'loading') {
-    window.addEventListener('DOMContentLoaded', boot, { once: true });
-  } else {
-    boot();
-  }
+  if (document.readyState !== 'loading') boot();
+  else window.addEventListener('DOMContentLoaded', boot);
 })();
